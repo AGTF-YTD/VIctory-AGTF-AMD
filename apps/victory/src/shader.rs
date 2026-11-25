@@ -72,6 +72,16 @@ struct Totals {
 }
 
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
+    // `VICTORY_DISASM_RAW=<file>`: that file's bytes as GFX10 code, listed.
+    if let Some(file) = std::env::var_os("VICTORY_DISASM_RAW") {
+        let code = std::fs::read(file)?;
+        let wave64 = std::env::var_os("VICTORY_DISASM_WAVE64").is_some();
+        match gfx10::decode(&code) {
+            Ok(insts) => insts.iter().for_each(|i| println!("{}", format_instruction(i, wave64))),
+            Err(e) => println!("({e})"),
+        }
+        return Ok(());
+    }
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
     for root in &paths {
@@ -168,14 +178,8 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     }
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
-                // The hash the runtime logs for this container (first 16 hex
-                // digits of its BLAKE3); `VICTORY_SHADER_HASHES` (comma-separated)
-                // limits the listing to those.
-                let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                let wanted = std::env::var("VICTORY_SHADER_HASHES")
-                    .map_or(true, |list| list.split(',').any(|h| h.trim() == hash));
-                if verbose && wanted {
-                    println!("{}{} [{hash}]: {line}", path.display(), source.label());
+                if verbose {
+                    println!("{}{}: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }

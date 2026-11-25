@@ -59,70 +59,77 @@ impl SigElement {
         }
     }
 
-    /// The start column as the signature parts count it: 0 for an
-    /// unallocated element (DXC's `GetColsAsMask` and usage shift).
-    fn start_col(&self) -> u8 {
-        if self.row.is_some() { self.col } else { 0 }
-    }
-
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.start_col()
-    }
-
-    /// The name `ISG1`/`OSG1`/`PSG1` carry: DXC's `GetName`, the element's
-    /// own for arbitrary semantics, the semantic's canonical spelling for
-    /// system values (whatever case the module's metadata uses).
-    fn part_name(&self) -> &str {
-        match self.kind {
-            1 => "SV_VertexID",
-            2 => "SV_InstanceID",
-            3 => "SV_Position",
-            4 => "SV_RenderTargetArrayIndex",
-            5 => "SV_ViewportArrayIndex",
-            6 => "SV_ClipDistance",
-            7 => "SV_CullDistance",
-            10 => "SV_PrimitiveID",
-            12 => "SV_SampleIndex",
-            13 => "SV_IsFrontFace",
-            14 => "SV_Coverage",
-            15 => "SV_InnerCoverage",
-            16 => "SV_Target",
-            17 => "SV_Depth",
-            18 => "SV_DepthLessEqual",
-            19 => "SV_DepthGreaterEqual",
-            20 => "SV_StencilRef",
-            28 => "SV_Barycentrics",
-            30 => "SV_CullPrimitive",
-            _ => &self.name,
-        }
-    }
-
-    /// Whether a signature part lists the element: DXC leaves out the
-    /// semantics its interpretation table marks `NotInSig` (pixel inputs
-    /// `SV_Coverage`, `SV_InnerCoverage`, `SV_CullPrimitive`), though their
-    /// names stay in the string table.
-    fn in_part(&self, input: bool) -> bool {
-        !(input && matches!(self.kind, 14 | 15 | 30))
+        ((1u8 << self.cols) - 1) << self.col
     }
 }
 
-/// `ISG1`/`OSG1`/`PSG1`: 32-byte rows, then the names, byte for byte as
-/// the validator rebuilds them from the module's signature metadata
-/// (`DxilProgramSignatureWriter` with validator version 1.6), so every
-/// field derives from the same [`SigElement`] the metadata does.
+/// Rows that integer elements move to: a console row `r` becomes
+/// `r + INTEGER_ROW_SHIFT` (see [`split_mixed_rows`]).
+const INTEGER_ROW_SHIFT: u32 = 16;
+
+/// Makes every packed row carry one interpolation mode, as the DXIL
+/// validator demands ("has interpolation mode that differs from another
+/// element packed into the same row"). The console packs by register and
+/// reads each channel its own way, so it freely mixes an integer channel
+/// (constant) with float channels (linear) in one row.
+///
+/// Stages link by register, so the rule must give the same layout to a
+/// vertex (or mesh) stage's outputs and to the pixel stage's inputs without
+/// either seeing the other: every linked integer element moves from row `r`
+/// to `r + 16`, whether or not its row is mixed in this stage, unless that
+/// row is taken (then it stays, as before). Running it twice changes
+/// nothing. A pixel shader's front-face input, which no earlier stage
+/// writes, moves to a free row of its own when its row is mixed.
+///
+/// shortcut: float elements read flat beside interpolated ones in one row
+/// stay mixed.
+pub(crate) fn split_mixed_rows(elements: &mut [SigElement], pixel_inputs: bool) {
+    let taken = |els: &[SigElement], row: u32| els.iter().any(|e| e.row == Some(row));
+    for i in 0..elements.len() {
+        let e = &elements[i];
+        let Some(row) = e.row else { continue };
+        if e.kind != 0 || e.comp == 9 || row >= INTEGER_ROW_SHIFT {
+            continue;
+        }
+        let to = row + INTEGER_ROW_SHIFT;
+        if !taken(elements, to) {
+            elements[i].row = Some(to);
+        }
+    }
+    if pixel_inputs {
+        for i in 0..elements.len() {
+            let e = &elements[i];
+            let Some(row) = e.row else { continue };
+            if e.kind != 13 {
+                continue;
+            }
+            let mixed = elements
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != i && o.row == Some(row) && o.interp != e.interp);
+            if mixed {
+                let free = (0..32).rev().find(|&r| !taken(elements, r));
+                if let Some(free) = free {
+                    elements[i].row = Some(free);
+                    elements[i].col = 0;
+                }
+            }
+        }
+    }
+}
+
+/// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
-    let listed: Vec<usize> = (0..elements.len())
-        .filter(|&i| elements[i].in_part(input))
-        .collect();
     let mut out = Vec::new();
-    out.extend((listed.len() as u32).to_le_bytes());
+    out.extend((elements.len() as u32).to_le_bytes());
     out.extend(8u32.to_le_bytes());
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
-    // the name's pointer, which is one static string per system value).
-    // Elements left out of the rows still get a name.
+    // the semantic's string, which is one static string per system value);
+    // the rows sorted by register (unallocated last).
     let mut offsets: Vec<u32> = Vec::new();
-    let mut next = 8 + 32 * listed.len() as u32;
+    let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
     for (i, e) in elements.iter().enumerate() {
         let shared = (e.kind != 0)
@@ -132,19 +139,21 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
             Some(j) => offsets.push(offsets[j]),
             None => {
                 offsets.push(next);
-                next += e.part_name().len() as u32 + 1;
-                names.push(e.part_name());
+                next += e.name.len() as u32 + 1;
+                names.push(&e.name);
             }
         }
     }
-    // Rows by register (unallocated last, as register -1), then by name
-    // offset (DXC's `sort_sig`); the sort is stable on ties, as DXC's
-    // insertion sort is on signatures this small.
-    let mut order = listed;
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
+    // By register alone, elements of one register in element order: DXC's
+    // writer sorts on (stream, register) only (an insertion sort at these
+    // sizes, so stable). Sorting on the column too reordered rows whose
+    // elements are listed right to left, and the validator refused them
+    // ("Container part 'Program Input Signature' does not match").
+    let mut order: Vec<usize> = (0..elements.len()).collect();
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.start_col();
+        let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -166,10 +175,27 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
@@ -178,7 +204,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -188,8 +214,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
-    /// Geometry: triangles to strips (see `Shader::rectangles`).
-    pub rectangles: bool,
+    /// Geometry (triangles in, triangle strips out on stream 0): its
+    /// maximum vertex count. `flag`: writes `SV_Position`.
+    pub geometry: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -243,13 +270,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    if p.rectangles {
-        // Triangles in, triangle strips out, stream 0, a position.
-        for (k, n) in [3u32, 5, 1].into_iter().enumerate() {
-            info[4 * k..4 * k + 4].copy_from_slice(&n.to_le_bytes());
-        }
-        info[12] = 1;
-        info[26..28].copy_from_slice(&(super::shader::RECTANGLE_VERTICES as u16).to_le_bytes());
+    if let Some(max_vertices) = p.geometry {
+        // Input primitive (3: triangles), output topology (5: triangle
+        // strips), stream mask, position written; the vertex maximum.
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -432,83 +460,38 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
-    fn el(name: &str, kind: u8, row: Option<u32>, col: u8, cols: u8, usage: u8) -> SigElement {
+    fn el(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
             kind,
-            comp: 9,
-            interp: 2,
-            row,
+            comp,
+            interp,
+            row: Some(row),
             col,
-            cols,
-            usage,
+            cols: 1,
+            usage: 1,
             half: false,
         }
     }
 
-    /// A part's rows: (name, register, mask, rw mask).
-    fn rows(part: &[u8]) -> Vec<(String, u32, u8, u8)> {
-        let u = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
-        (0..u(0) as usize)
-            .map(|k| {
-                let at = 8 + 32 * k;
-                let name = &part[u(at + 4) as usize..];
-                let name = name.split(|&b| b == 0).next().unwrap();
-                (
-                    String::from_utf8(name.to_vec()).unwrap(),
-                    u(at + 20),
-                    part[at + 24],
-                    part[at + 25],
-                )
-            })
-            .collect()
-    }
-
-    /// Elements sharing a row are listed by name offset (element order),
-    /// not by column, as the validator's rebuilt part lists them.
+    /// An integer channel beside float ones leaves the row, the same way
+    /// whether or not the other stage has the floats, and only once.
     #[test]
-    fn a_shared_row_keeps_element_order() {
-        let els = [
-            el("TEXCOORD", 0, Some(1), 2, 2, 0b11),
-            el("COLOR", 0, Some(1), 0, 2, 0b01),
-            el("NORMAL", 0, Some(0), 0, 3, 0b111),
-        ];
-        let r = rows(&signature(&els, true));
-        let names: Vec<_> = r.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(names, ["NORMAL", "TEXCOORD", "COLOR"]);
-        assert_eq!((r[1].2, r[1].3), (0b1100, 0b1100));
-        assert_eq!((r[2].2, r[2].3), (0b0011, 0b0001));
-    }
-
-    /// An unallocated element counts its mask and usage from column 0,
-    /// whatever column it carries; outputs mark the unwritten channels.
-    #[test]
-    fn unallocated_elements_count_from_column_zero() {
-        let els = [el("SV_Depth", 17, None, 2, 1, 1)];
-        assert_eq!(
-            rows(&signature(&els, false)),
-            [("SV_Depth".into(), u32::MAX, 1, 0b1110)]
-        );
-        let els = [el("SV_Barycentrics", 28, None, 1, 3, 0b110)];
-        assert_eq!(
-            rows(&signature(&els, true)),
-            [("SV_Barycentrics".into(), u32::MAX, 0b111, 0b110)]
-        );
-    }
-
-    /// System values carry their canonical name; input coverage is named but
-    /// not listed (DXC's `NotInSig`).
-    #[test]
-    fn system_value_names_and_left_out_elements() {
-        let mut cov = el("SV_COVERAGE", 14, None, 0, 1, 1);
-        cov.comp = 5;
-        let els = [el("SV_POSITION", 3, Some(0), 0, 4, 0b11), cov];
-        let part = signature(&els, true);
-        assert_eq!(rows(&part), [("SV_Position".into(), 0, 0b1111, 0b11)]);
-        // Both names in the string table, the coverage's after the row.
-        assert!(part.ends_with(b"SV_Position\0SV_Coverage\0"));
-        assert_eq!(part.len(), 8 + 32 + 12 + 12);
+    fn integer_channels_leave_mixed_rows() {
+        let mut both = vec![el("A", 0, 9, 2, 4, 0), el("B", 0, 5, 1, 4, 1)];
+        let mut alone = vec![el("B", 0, 5, 1, 4, 1)];
+        split_mixed_rows(&mut both, false);
+        split_mixed_rows(&mut alone, false);
+        assert_eq!((both[0].row, both[1].row), (Some(4), Some(20)));
+        assert_eq!(alone[0].row, Some(20));
+        let again = both.clone();
+        split_mixed_rows(&mut both, false);
+        assert_eq!(both, again);
+        // A pixel shader's front face moves to a free row of its own.
+        let mut ps = vec![el("N", 0, 9, 2, 9, 0), el("SV_IsFrontFace", 13, 5, 1, 9, 1)];
+        split_mixed_rows(&mut ps, true);
+        assert_eq!((ps[0].row, ps[1].row, ps[1].col), (Some(9), Some(31), 0));
     }
 
     #[test]
